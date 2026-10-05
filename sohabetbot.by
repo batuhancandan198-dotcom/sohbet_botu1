@@ -1,0 +1,446 @@
+import os
+import sys
+import traceback
+import json
+import time
+import random
+import re
+from collections import defaultdict, deque
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+
+print("[BOOT 1] main.py basladi", flush=True)
+
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN Railway Variables içinde tanımlı değil.")
+
+print("[BOOT 2] BOT_TOKEN mevcut", flush=True)
+
+try:
+    import telebot
+    from telebot import types
+    print("[BOOT 3] telebot import edildi", flush=True)
+except Exception as exc:
+    print(f"[BOOT 3] telebot import HATASI: {type(exc).__name__}: {exc}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
+
+bot = telebot.TeleBot(TOKEN)
+
+# Kullanıcı başına son birkaç mesajı tutar. Bot yeniden başlarsa sıfırlanır.
+SOHBET_HAFIZASI = defaultdict(lambda: deque(maxlen=6))
+KUFUR_UYARILARI = defaultdict(int)
+
+KUFUR_KELIMELERI = {
+    "amk", "aq", "mk", "m.k", "siktir", "sikeyim", "sikik", "sik", "orospu",
+    "oç", "oc", "piç", "pezevenk", "yarrak", "yarak", "salak", "gerizekali",
+    "gerizekalı", "aptal", "mal", "eşşek", "esek", "ananı", "anan",
+    "göt", "got", "ibne", "kahpe", "dangalak"
+}
+
+def ana_menu():
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        types.KeyboardButton("📱 Sanal No"),
+        types.KeyboardButton("💰 Bakiye"),
+        types.KeyboardButton("💬 Sohbet"),
+        types.KeyboardButton("👤 Telegram ID"),
+        types.KeyboardButton("❓ Yardım"),
+    )
+    return markup
+
+def smsvirtual_profile():
+    api_key = os.getenv("SMSV_API_KEY")
+    if not api_key:
+        return None, "SMSV_API_KEY tanımlı değil."
+
+    req = Request(
+        "https://api.smsvirtual.io/v1/profile/",
+        headers={"x-api-key": api_key, "Accept": "application/json"},
+        method="GET",
+    )
+
+    try:
+        with urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except HTTPError as exc:
+        return None, f"API HTTP hatası: {exc.code}"
+    except (URLError, TimeoutError) as exc:
+        return None, f"API bağlantı hatası: {type(exc).__name__}"
+    except Exception as exc:
+        return None, f"API hatası: {type(exc).__name__}"
+
+def temiz_metin(metin):
+    return re.sub(r"\s+", " ", (metin or "").strip())
+
+def kufur_var_mi(metin):
+    kelimeler = re.findall(
+        r"[a-zçğıöşü0-9']+",
+        (metin or "").lower()
+    )
+    return any(k in KUFUR_KELIMELERI for k in kelimeler)
+
+def duygu_ve_stil(metin):
+    m = (metin or "").lower()
+    emoji_sayisi = sum(1 for c in metin if ord(c) > 10000) if metin else 0
+
+    heyecan = "!" in metin or m.count("haha") > 0 or m.count("😂") > 0
+
+    uzgun = any(x in m for x in (
+        "üzgün", "uzgun", "moralim bozuk", "canım sıkkın",
+        "canim sikkin", "kötüyüm", "kotuyum", "berbat"
+    ))
+
+    kizgin = any(x in m for x in (
+        "sinirliyim", "sinir oldum", "delirdim",
+        "çok kızgınım", "cok kizginim"
+    ))
+
+    saka = any(x in m for x in (
+        "şaka", "saka", "haha", "ahah", "lol", "😂", "🤣"
+    ))
+
+    samimi = any(x in m for x in (
+        "kanka", "dostum", "bro", "aga", "abi", "reis", "hocam"
+    ))
+
+    if uzgun:
+        return "destekleyici"
+    if kizgin:
+        return "sakin"
+    if saka or heyecan or emoji_sayisi:
+        return "esprili"
+    if samimi:
+        return "samimi"
+
+    return "normal"
+
+def son_konusma(user_id):
+    return list(SOHBET_HAFIZASI[user_id])
+
+def hafizaya_ekle(user_id, rol, metin):
+    SOHBET_HAFIZASI[user_id].append({
+        "rol": rol,
+        "metin": temiz_metin(metin)[:500]
+    })
+
+def kufur_yanit(user_id):
+    KUFUR_UYARILARI[user_id] += 1
+    seviye = KUFUR_UYARILARI[user_id]
+
+    cevaplar = [
+        "😏 Ooo, dil biraz vites yükseltti. Sakin ol reis, bana sökmez.",
+        "😂 Küfür kontenjanını doldurma, daha yeni başladık. Düzgün konuş da muhabbet akıp gitsin.",
+        "😎 Tamam tamam, klavyenin gazını biraz keselim. Lafı bana değil konuya çak.",
+        "🙃 Sert girdin ama ben kavga moduna geçmem. Bir cümle daha dene, bu sefer adam gibi muhabbet edelim.",
+        "😂 Beşinci viteste gelmişsin. Freni bulalım da sohbeti devam ettirelim."
+    ]
+
+    if seviye >= 4:
+        return "🛑 Küfürü azaltalım dostum. Takılacaksan takıl, ama karşılıklı saygıyı koruyalım. Ben yine buradayım."
+
+    return random.choice(cevaplar)
+
+def sohbet_yanit(user_id, metin):
+    m = temiz_metin(metin)
+    low = m.lower()
+
+    if kufur_var_mi(m):
+        return kufur_yanit(user_id)
+
+    stil = duygu_ve_stil(m)
+    gecmis = son_konusma(user_id)
+    onceki = gecmis[-1]["metin"] if gecmis else ""
+
+    if any(x in low for x in (
+        "fal bak", "falına bak", "falina bak",
+        "kahve falı", "kahve fali"
+    )):
+        return "🔮 Fal moduna geçebiliriz. Sohbeti bırakıp direkt fal tarafına geçelim; ne tür fal istiyorsun?"
+
+    if any(x in low for x in (
+        "sorgu yap", "sorgulama", "sorgu", "sorgula"
+    )):
+        return "🔍 Sorgulama tarafına geçebiliriz. Ne yapmak istediğini yaz, uygun menüye yönlendireyim."
+
+    if any(x in low for x in (
+        "sanal no", "sanal numara", "sms",
+        "sms numarası", "sms numarasi"
+    )):
+        return "📱 Sanal numara tarafına geçiyoruz. İstersen menüden 📱 Sanal No'ya dokun."
+
+    if any(x in low for x in (
+        "bakiye", "param ne kadar", "hesapta ne var"
+    )):
+        return "💰 Bakiye kontrolü için menüden 💰 Bakiye'ye basabilirsin."
+
+    if low in (
+        "selam", "merhaba", "sa", "s.a",
+        "selamlar", "hey", "hello"
+    ):
+        return random.choice([
+            "👋 Selam dostum! Nasılsın, bugün ne karıştırıyoruz?",
+            "😎 Selam kanka! Geldin yine. Muhabbet mi, fal mı, sorgu mu?",
+            "👋 Hoş geldin reis. Ben buradayım, konu sende.",
+            "😂 Selam! Klavye çalışıyor, bot çalışıyor. Şimdi sıra sende."
+        ])
+
+    if any(x in low for x in (
+        "nasılsın", "nasilsin", "naber",
+        "ne haber", "napıyorsun", "napiyorsun"
+    )):
+        return random.choice([
+            "😄 İyiyim dostum, sistem ayakta. Senin keyifler nasıl?",
+            "🤖 Ben iyiyim; elektrikli ruh hâlim yerinde. Sende durumlar nasıl?",
+            "😂 Benden yana sıkıntı yok. Sen anlat, bugün modlar nasıl?"
+        ])
+
+    if any(x in low for x in (
+        "teşekkür", "tesekkur", "sağ ol",
+        "sag ol", "eyvallah", "eyw"
+    )):
+        return random.choice([
+            "😎 Eyvallah dostum, ne demek.",
+            "🤝 Rica ederim kanka. Devam ediyoruz.",
+            "😂 Estağfurullah, görev başındayız."
+        ])
+
+    if any(x in low for x in (
+        "şaka", "saka", "espri",
+        "güldür", "guldur", "komik"
+    )):
+        return random.choice([
+            "😂 Benim espri seviyesi bazen Wi-Fi gibi: çekiyor ama ne zaman kopacağı belli değil.",
+            "🤣 Botun mizah departmanı açık. Maaş yok ama ego çok.",
+            "😏 Sana bir espri yapardım ama sistem kaynakları seni kaldırır mı emin değilim."
+        ])
+
+    if any(x in low for x in (
+        "kimsin", "sen kimsin", "adın ne", "adin ne"
+    )):
+        return "🤖 Ben Savitar. Sohbet ederim, menüdeki özelliklere yönlendiririm; gerektiğinde de lafı tatlı tatlı çeviririm."
+
+    if any(x in low for x in (
+        "canım sıkkın", "canim sikkin",
+        "moralim bozuk", "üzgünüm",
+        "uzgunum", "kötüyüm", "kotuyum"
+    )):
+        return "❤️ Canını sıkan bir şey varsa anlatabilirsin. Yargılamadan dinlerim. İstersen ciddi konuşuruz, istersen kafanı dağıtırız."
+
+    if any(x in low for x in (
+        "sinirliyim", "sinir oldum",
+        "delirdim", "çok kızgınım", "cok kizginim"
+    )):
+        return "🧊 Önce bir nefes. Ne olduysa anlat; beraber sakin sakin bakalım."
+
+    if low.endswith("?") or any(x in low for x in (
+        "neden", "nasıl", "nasil", "ne zaman",
+        "nerede", "kim", "ne yapayım", "ne yapayim"
+    )):
+        return "🤔 Güzel soru. Biraz daha detay verirsen konuya göre net cevap verebilirim. İstersen sohbeti de sürdürebiliriz."
+
+    if any(x in low for x in (
+        "devam", "sonra", "peki",
+        "ee", "e şimdi", "simdi ne"
+    )) and onceki:
+        return f"😎 Devam ediyoruz. Az önceki konuya göre söylersen: “{onceki[:120]}” üzerinden gidebiliriz."
+
+    if stil == "destekleyici":
+        return "❤️ Anladım dostum. İstersen biraz daha anlat, buradayım."
+
+    if stil == "esprili":
+        return random.choice([
+            "😂 Tamam, enerjiyi aldım. Muhabbeti nereye kırıyoruz?",
+            "😏 Güzel giriş. Bunun devamı varsa dökül, merak ettim.",
+            "🤣 Bu konuşma bir yere gidiyor ama direksiyon sende."
+        ])
+
+    if stil == "samimi":
+        return random.choice([
+            "😎 Aynen kanka, anlat bakalım.",
+            "🤝 Tamam dostum, seni dinliyorum.",
+            "😂 Heh, şimdi muhabbet başladı. Devam et."
+        ])
+
+    return random.choice([
+        "🤖 Anladım. Devam et, seni dinliyorum.",
+        "💬 Tamam, konuyu aldım. Biraz daha anlat.",
+        "😎 Olur. Nereden devam edelim?",
+        "👀 İlginçmiş. Detayını merak ettim."
+    ])
+
+def mesaj_isle(message):
+    if not message.text:
+        return
+
+    user_id = message.from_user.id
+    metin = temiz_metin(message.text)
+
+    hafizaya_ekle(user_id, "user", metin)
+
+    cevap = sohbet_yanit(user_id, metin)
+
+    hafizaya_ekle(user_id, "bot", cevap)
+
+    bot.reply_to(message, cevap)
+
+@bot.message_handler(commands=["start"])
+def start(message):
+    SOHBET_HAFIZASI[message.from_user.id].clear()
+
+    text = """🤖 Bot aktif!
+
+Artık daha doğal sohbet edebilirim:
+💬 Muhabbet ve bağlam
+😂 Şaka ve espri
+❤️ Duyguya göre cevap
+🎭 Konuşma tarzına uyum
+🔮 Fal / 🔍 Sorgulama geçişleri
+
+Aşağıdaki menüden bir özellik seçebilirsin."""
+
+    bot.send_message(
+        message.chat.id,
+        text,
+        reply_markup=ana_menu()
+    )
+
+@bot.message_handler(commands=["id"])
+def user_id(message):
+    bot.reply_to(
+        message,
+        f"🆔 Telegram ID: {message.from_user.id}"
+    )
+
+@bot.message_handler(commands=["help"])
+def help_command(message):
+    text = """❓ Yardım
+
+💬 Sohbet — Doğal sohbet, kısa bağlam hafızası, espri ve duygu uyumu.
+📱 Sanal No — SMS Virtual hesabı için güvenli durum menüsü.
+💰 Bakiye — SMS Virtual hesap bakiyesini kontrol eder.
+👤 Telegram ID — Telegram kullanıcı ID'nizi gösterir.
+
+Komutlar: /start /id /help
+
+Not: Küfür/argo tespitinde sohbeti kavga moduna çevirmeden uyarırım."""
+
+    bot.send_message(
+        message.chat.id,
+        text,
+        reply_markup=ana_menu()
+    )
+
+@bot.message_handler(func=lambda message: message.text == "👤 Telegram ID")
+def menu_id(message):
+    user_id(message)
+
+@bot.message_handler(func=lambda message: message.text == "❓ Yardım")
+def menu_help(message):
+    help_command(message)
+
+@bot.message_handler(func=lambda message: message.text == "💰 Bakiye")
+def balance(message):
+    data, error = smsvirtual_profile()
+
+    if error:
+        bot.reply_to(
+            message,
+            f"⚠️ Bakiye alınamadı: {error}"
+        )
+        return
+
+    if isinstance(data, dict):
+        profile = data.get("data", data)
+
+        if not isinstance(profile, dict):
+            profile = data.get("profile", data)
+    else:
+        profile = {}
+
+    value = (
+        profile.get("balance", "bilinmiyor")
+        if isinstance(profile, dict)
+        else "bilinmiyor"
+    )
+
+    bot.reply_to(
+        message,
+        f"💰 SMS Virtual bakiye: {value}"
+    )
+
+@bot.message_handler(func=lambda message: message.text == "📱 Sanal No")
+def virtual_number(message):
+    text = """📱 Sanal Numara
+
+Bu menü şu anda yalnızca hesap durumunu kontrol eder.
+Numara satın alma veya doğrulama işlemi otomatikleştirilmemiştir."""
+
+    bot.send_message(
+        message.chat.id,
+        text
+    )
+
+@bot.message_handler(func=lambda message: message.text == "💬 Sohbet")
+def chat_mode(message):
+    bot.reply_to(
+        message,
+        "💬 Sohbet moduna geçtik. Ne konuşmak istersen yaz; bağlamı birkaç mesaj boyunca koruyacağım."
+    )
+
+@bot.message_handler(func=lambda message: True)
+def text_handler(message):
+    mesaj_isle(message)
+
+try:
+    print("[BOOT 4] TeleBot olusturuldu", flush=True)
+
+    me = bot.get_me()
+
+    print(
+        f"[BOOT 5] Telegram baglantisi OK: @{me.username}",
+        flush=True
+    )
+
+    try:
+        bot.delete_webhook(drop_pending_updates=False)
+
+        print(
+            "[BOOT 6] Webhook temizlendi",
+            flush=True
+        )
+
+    except Exception as exc:
+        print(
+            f"[BOOT 6] Webhook temizleme uyarisi: {type(exc).__name__}: {exc}",
+            flush=True
+        )
+
+    print(
+        "[BOOT 7] Gelistirilmis sohbet sistemi hazir",
+        flush=True
+    )
+
+    print(
+        "[BOOT 8] Polling baslatiliyor...",
+        flush=True
+    )
+
+    # Tek bir polling sahibi olsun.
+    # infinity_polling kendi yeniden deneme mekanizmasına sahiptir.
+    bot.infinity_polling(
+        skip_pending=False,
+        timeout=30,
+        long_polling_timeout=30,
+        allowed_updates=["message", "callback_query"]
+    )
+
+except Exception as exc:
+    print(
+        f"[BOOT] UYGULAMA HATASI: {type(exc).__name__}: {exc}",
+        flush=True
+    )
+
+    traceback.print_exc()
+    sys.exit(1)
