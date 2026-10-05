@@ -2,7 +2,6 @@ import os
 import sys
 import traceback
 import json
-import time
 import random
 import re
 from collections import defaultdict, deque
@@ -28,17 +27,31 @@ except Exception as exc:
 
 bot = telebot.TeleBot(TOKEN)
 
-# Kullanıcı başına son birkaç mesajı tutar. Bot yeniden başlarsa sıfırlanır.
-SOHBET_HAFIZASI = defaultdict(lambda: deque(maxlen=6))
+# ---------------------------------------------------------------------------
+# SOHBET HAFIZASI
+# ---------------------------------------------------------------------------
+# Her kullanıcı için son 12 konuşma turunu tutar.
+# Railway yeniden başlatılırsa RAM belleği sıfırlanır.
+SOHBET_HAFIZASI = defaultdict(lambda: deque(maxlen=12))
 KUFUR_UYARILARI = defaultdict(int)
+SON_CEVAPLAR = defaultdict(lambda: deque(maxlen=8))
 
+# ---------------------------------------------------------------------------
+# KUFUR / HAKARET TESPITI
+# Bot kendi cevabında küfür kullanmaz.
+# ---------------------------------------------------------------------------
 KUFUR_KELIMELERI = {
-    "amk", "aq", "mk", "m.k", "siktir", "sikeyim", "sikik", "sik", "orospu",
-    "oç", "oc", "piç", "pezevenk", "yarrak", "yarak", "salak", "gerizekali",
-    "gerizekalı", "aptal", "mal", "eşşek", "esek", "ananı", "anan",
-    "göt", "got", "ibne", "kahpe", "dangalak"
+    "amk", "aq", "a.q", "mk", "m.k", "siktir", "sikeyim", "sikik",
+    "sik", "orospu", "oç", "oc", "piç", "pezevenk", "yarrak", "yarak",
+    "salak", "gerizekali", "gerizekalı", "aptal", "mal", "eşşek", "esek",
+    "ananı", "anani", "anan", "göt", "got", "ibne", "kahpe", "dangalak",
+    "şerefsiz", "serefsiz", "haysiyetsiz", "puşt", "pust", "bok",
+    "boktan", "sikikçe", "siktirgit", "siktir git"
 }
 
+# ---------------------------------------------------------------------------
+# ANA MENÜ
+# ---------------------------------------------------------------------------
 def ana_menu():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add(
@@ -50,6 +63,10 @@ def ana_menu():
     )
     return markup
 
+
+# ---------------------------------------------------------------------------
+# SMS VIRTUAL
+# ---------------------------------------------------------------------------
 def smsvirtual_profile():
     api_key = os.getenv("SMSV_API_KEY")
     if not api_key:
@@ -57,7 +74,10 @@ def smsvirtual_profile():
 
     req = Request(
         "https://api.smsvirtual.io/v1/profile/",
-        headers={"x-api-key": api_key, "Accept": "application/json"},
+        headers={
+            "x-api-key": api_key,
+            "Accept": "application/json"
+        },
         method="GET",
     )
 
@@ -71,205 +91,554 @@ def smsvirtual_profile():
     except Exception as exc:
         return None, f"API hatası: {type(exc).__name__}"
 
+
+# ---------------------------------------------------------------------------
+# METİN YARDIMCILARI
+# ---------------------------------------------------------------------------
 def temiz_metin(metin):
     return re.sub(r"\s+", " ", (metin or "").strip())
 
+
+def normalize(metin):
+    m = temiz_metin(metin).lower()
+    # Noktalama ve günlük yazım farklılıklarını biraz daha rahat yakala.
+    m = m.replace("’", "'").replace("ı", "i")
+    m = re.sub(r"[^\w\s']", " ", m, flags=re.UNICODE)
+    m = re.sub(r"\s+", " ", m).strip()
+    return m
+
+
+def kelimeler(metin):
+    return re.findall(r"[a-zçğıöşü0-9']+", (metin or "").lower())
+
+
 def kufur_var_mi(metin):
-    kelimeler = re.findall(
-        r"[a-zçğıöşü0-9']+",
-        (metin or "").lower()
-    )
-    return any(k in KUFUR_KELIMELERI for k in kelimeler)
+    low = normalize(metin)
+    return any(k in low.split() for k in KUFUR_KELIMELERI)
 
+
+def son_konusma(user_id):
+    return list(SOHBET_HAFIZASI[user_id])
+
+
+def hafizaya_ekle(user_id, rol, metin):
+    SOHBET_HAFIZASI[user_id].append({
+        "rol": rol,
+        "metin": temiz_metin(metin)[:600]
+    })
+
+
+def cevap_sec(user_id, havuz):
+    """
+    Son kullanılan cevapları mümkün olduğunca tekrar etmez.
+    Havuz çok küçükse yine güvenli şekilde seçim yapar.
+    """
+    if not havuz:
+        return "Buradayım dostum. Konuyu biraz aç, beraber devam edelim."
+
+    son = set(SON_CEVAPLAR[user_id])
+    uygun = [x for x in havuz if x not in son]
+
+    secilen = random.choice(uygun or havuz)
+    SON_CEVAPLAR[user_id].append(secilen)
+    return secilen
+
+
+def eslesen(metin, ifadeler):
+    low = normalize(metin)
+    return any(normalize(x) in low for x in ifadeler)
+
+
+# ---------------------------------------------------------------------------
+# DUYGU / KONU / KONUŞMA TARZI
+# ---------------------------------------------------------------------------
 def duygu_ve_stil(metin):
-    m = (metin or "").lower()
-    emoji_sayisi = sum(1 for c in metin if ord(c) > 10000) if metin else 0
+    low = normalize(metin)
+    raw = metin or ""
 
-    heyecan = "!" in metin or m.count("haha") > 0 or m.count("😂") > 0
+    heyecan = (
+        "!" in raw
+        or "haha" in low
+        or "ahah" in low
+        or "lol" in low
+        or "😂" in raw
+        or "🤣" in raw
+    )
 
-    uzgun = any(x in m for x in (
-        "üzgün", "uzgun", "moralim bozuk", "canım sıkkın",
-        "canim sikkin", "kötüyüm", "kotuyum", "berbat"
-    ))
+    uzgun = eslesen(low, [
+        "üzgünüm", "uzgunum", "moralim bozuk", "canım sıkkın",
+        "canim sikkin", "kötüyüm", "kotuyum", "berbatım",
+        "berbatim", "keyfim yok", "modum düşük", "modum dusuk",
+        "içim sıkılıyor", "icim sikiliyor"
+    ])
 
-    kizgin = any(x in m for x in (
-        "sinirliyim", "sinir oldum", "delirdim",
-        "çok kızgınım", "cok kizginim"
-    ))
+    kizgin = eslesen(low, [
+        "sinirliyim", "sinir oldum", "delirdim", "çok kızgınım",
+        "cok kizginim", "tepem attı", "tepem atti", "çok sinirlendim"
+    ])
 
-    saka = any(x in m for x in (
-        "şaka", "saka", "haha", "ahah", "lol", "😂", "🤣"
-    ))
+    mutlu = eslesen(low, [
+        "çok mutluyum", "cok mutluyum", "mutluyum", "keyfim yerinde",
+        "çok iyiyim", "cok iyiyim", "harikayım", "harikayim",
+        "bugün çok iyi", "bugun cok iyi"
+    ])
 
-    samimi = any(x in m for x in (
-        "kanka", "dostum", "bro", "aga", "abi", "reis", "hocam"
-    ))
+    saka = eslesen(low, [
+        "şaka", "saka", "haha", "ahah", "lol", "espri", "güldür",
+        "guldur", "komik"
+    ])
+
+    samimi = eslesen(low, [
+        "kanka", "dostum", "bro", "aga", "abi", "reis", "hocam",
+        "moruk", "kardeşim", "kardesim"
+    ])
 
     if uzgun:
         return "destekleyici"
     if kizgin:
         return "sakin"
-    if saka or heyecan or emoji_sayisi:
+    if mutlu:
+        return "neşeli"
+    if saka or heyecan:
         return "esprili"
     if samimi:
         return "samimi"
-
     return "normal"
 
-def son_konusma(user_id):
-    return list(SOHBET_HAFIZASI[user_id])
 
-def hafizaya_ekle(user_id, rol, metin):
-    SOHBET_HAFIZASI[user_id].append({
-        "rol": rol,
-        "metin": temiz_metin(metin)[:500]
-    })
-
+# ---------------------------------------------------------------------------
+# KUFUR CEVAPLARI
+# ---------------------------------------------------------------------------
 def kufur_yanit(user_id):
     KUFUR_UYARILARI[user_id] += 1
     seviye = KUFUR_UYARILARI[user_id]
 
-    cevaplar = [
-        "😏 Ooo, dil biraz vites yükseltti. Sakin ol reis, bana sökmez.",
-        "😂 Küfür kontenjanını doldurma, daha yeni başladık. Düzgün konuş da muhabbet akıp gitsin.",
-        "😎 Tamam tamam, klavyenin gazını biraz keselim. Lafı bana değil konuya çak.",
-        "🙃 Sert girdin ama ben kavga moduna geçmem. Bir cümle daha dene, bu sefer adam gibi muhabbet edelim.",
-        "😂 Beşinci viteste gelmişsin. Freni bulalım da sohbeti devam ettirelim."
+    if seviye >= 5:
+        havuz = [
+            "🛑 Tamam dostum, sertliği biraz azaltalım. Takılacaksan takıl ama muhabbeti seviyeyi düşürmeden sürdürelim.",
+            "😏 Üslubu toparlayalım. Ben buradayım; düzgün konuşursan muhabbet de daha iyi akar.",
+            "🙂 Sinirini anlıyorum ama küfürü azaltalım. Ne olduysa anlat, konuya bakalım."
+        ]
+    elif seviye >= 3:
+        havuz = [
+            "😏 Bu tonla soru sorunca cevaptan çok üslubun dikkat çekiyor. Bir daha dene.",
+            "🧊 Sakin ol şampiyon, klavyeye bu kadar yüklenmene gerek yok. Ne konuşuyorduk?",
+            "Bana ne mi? Önce üslubunu toparla, sonra konuşuruz. 😏",
+            "😂 Gazı biraz keselim dostum. Lafı sertleştirmek yerine derdini anlat, oradan yürüyelim."
+        ]
+    else:
+        havuz = [
+            "😏 Ooo, dil biraz vites yükseltti. Sakin ol reis, bana sökmez.",
+            "😂 Küfür kontenjanını doldurma. Düzgün konuş da muhabbet akıp gitsin.",
+            "😎 Klavyenin gazını biraz keselim. Lafı bana değil konuya çak.",
+            "🙃 Sert girdin ama ben kavga moduna geçmem. Bir daha dene, bu kez düzgün muhabbet edelim.",
+            "😏 Küfürü bir kenara bırakalım. Söyle bakalım, asıl mesele ne?"
+        ]
+
+    return cevap_sec(user_id, havuz)
+
+
+# ---------------------------------------------------------------------------
+# KONUŞMA HAVUZLARI
+# ---------------------------------------------------------------------------
+SELAMLAMA = [
+    "👋 Selam dostum! Geldin yine. Bugün ne konuşuyoruz?",
+    "😎 Selam kanka! Ben buradayım. Sende ne var ne yok?",
+    "👋 Hoş geldin reis. Konu sende, ben dinliyorum.",
+    "😂 Selam! Sistemler açık, muhabbet servisi hazır. Ne anlatıyorsun?",
+    "🤝 Selam dostum. Bugün modlar nasıl?",
+    "😄 Selamlar! Hadi bakalım, bu sefer hangi konuyla geldin?",
+    "👀 Selam! Seni gördük, şimdi merak ettim: ne konuşacağız?",
+    "😎 Hey! Muhabbet kapısı açık. Dökül bakalım."
+]
+
+NASILSIN = [
+    "😄 İyiyim dostum, sistemler sağlam. Asıl sen nasılsın?",
+    "🤖 Benden yana durumlar iyi. Dijital ruh hâlim yerinde; sende hayat nasıl?",
+    "😂 Ben iyiyim, elektrikli ruh hâlim stabil. Senin keyifler nasıl?",
+    "😎 Gayet iyiyim. Sen bugün iyi misin, yoksa anlatacak bir hikâyen mi var?",
+    "🤝 İyiyim dostum. Ama asıl seni merak ettim, günün nasıl geçiyor?",
+    "👀 Bende sıkıntı yok. Senin tarafta neler oluyor?",
+    "😄 Fena değilim. Hatta sohbet edecek birini bekliyordum. Senin mod kaç?",
+    "😂 Ben hazır kıta bekliyorum. Senin keyifler yerinde mi?"
+]
+
+GUNLUK_MUHABBET = [
+    "😎 Buradayım, muhabbet modundayım. Sende ne var ne yok?",
+    "😂 Şimdilik dijital mesai devam ediyor. Sen neler yapıyorsun?",
+    "👀 Ben buradayım. Asıl sen ne karıştırıyorsun?",
+    "🤖 Sistemler çalışıyor, ben de sohbet peşindeyim. Gün nasıl gidiyor?",
+    "😄 Çok büyük olaylar yok. Sen anlat, bugün neler oldu?",
+    "😎 Rutin dijital hayat işte. Ama sen gelince muhabbet hareketlendi.",
+    "🤝 Buradayım dostum. Konuyu sen seç, oradan yürüyelim."
+]
+
+TESEKKUR = [
+    "😎 Eyvallah dostum, ne demek.",
+    "🤝 Rica ederim kanka. Her zaman.",
+    "😂 Estağfurullah, görev başındayız.",
+    "😄 Ne demek dostum. Devam ediyoruz.",
+    "🫡 Lafı bile olmaz. Başka neye bakalım?",
+    "🤝 Her zaman. Şimdi sıradaki konu ne?"
+]
+
+ESPRI = [
+    "😂 Benim espri seviyesi bazen Wi-Fi gibi: çekiyor ama ne zaman kopacağı belli değil.",
+    "🤣 Botun mizah departmanı açık. Maaş yok ama ego çok.",
+    "😏 Sana bir espri yapardım ama sistem kaynakları seni kaldırır mı emin değilim.",
+    "😂 Bugün mizah departmanı fazla mesai yapıyor. Hazır ol.",
+    "🤣 Ciddiyet bekliyorsan yanlış kapıdasın. Ama kötü espri konusunda oldukça istikrarlıyım.",
+    "😎 Espri istedin, sorumluluk artık sende. Gülmezsen sistemi suçlama."
+]
+
+DESTEK = [
+    "❤️ Canını sıkan bir şey varsa anlatabilirsin. Yargılamadan dinlerim.",
+    "🫂 Anladım dostum. İstersen biraz daha anlat, birlikte toparlayalım.",
+    "❤️ Böyle hissetmen normal. Ne olduğunu anlatmak istersen buradayım.",
+    "🤝 Önce bir sakinleşelim. Sonra ne olduğunu beraber konuşuruz.",
+    "🧠 Kafanda çok şey dönüyorsa tek tek anlatabilirsin. Acelemiz yok."
+]
+
+Sakin = [
+    "🧊 Önce bir nefes. Ne olduysa anlat; beraber sakin sakin bakalım.",
+    "🤝 Sinirlenmen anlaşılır. Ama önce olayı bir anlat, beraber değerlendirelim.",
+    "😌 Tamam, önce frene basalım. Sonra neye kızdığını konuşuruz.",
+    "🧠 Bir dakika durup olayı parçalayalım. Ne oldu?"
+]
+
+MUTLU = [
+    "🔥 İşte bunu duymak güzel! Ne oldu da keyfin böyle yerine geldi?",
+    "😄 Güzel! Enerjin buraya kadar geldi. Anlatsana, ne oldu?",
+    "🥳 İşte böyle! Mutluluğun sebebi ne, merak ettim.",
+    "😎 Mod yüksek belli. Bunun hikâyesini dinlemek isterim.",
+    "😂 Nihayet güzel haber! Dökül bakalım, ne yaşandı?"
+]
+
+TEPKI = [
+    "👀 Aynen, olay biraz beklenmedikmiş. Devamı ne?",
+    "😂 Ben de tam orada bir durup düşündüm. Sonra ne oldu?",
+    "😏 İşte şimdi merak ettim. Biraz daha anlat.",
+    "🤣 Yok artık seviyesine geldiysek hikâye ciddi ilginçleşti.",
+    "👀 Cidden mi? Detayını kaçırma, anlat.",
+    "😄 Hadi ya! Bunun devamı varsa dinliyorum."
+]
+
+VEDA = [
+    "👋 Görüşürüz dostum. Yine gel, muhabbet yarım kalmasın.",
+    "🤝 Tamamdır kanka, sonra devam ederiz. Kendine iyi bak.",
+    "😎 Kaç bakalım. Ama geri dönmeyi unutma.",
+    "👋 Görüşürüz reis. Bir dahaki gelişinde kaldığımız yerden.",
+    "🌙 İyi geceler dostum. Kafan rahat olsun, sonra konuşuruz.",
+    "🤝 Hadi kendine iyi bak. Muhabbet burada bitmedi."
+]
+
+ONAY = [
+    "😎 Aynen, ben de öyle düşünüyorum.",
+    "🤝 Katılıyorum. Mantıklı bir nokta.",
+    "👀 Evet, burada dediğinde bir şey var.",
+    "😄 Aynen öyle. Devamını da merak ettim.",
+    "👍 Doğru. Bunun üstünden biraz daha gidebiliriz."
+]
+
+RED = [
+    "🤔 Olabilir. Neden öyle düşündüğünü merak ettim.",
+    "👀 Tamam, sen öyle görüyorsun. Biraz açarsan fikrini daha iyi anlayabilirim.",
+    "😄 Peki, karşı tarafı da dinledik. Senin gerekçen ne?",
+    "🤝 Tamamdır. Katılmıyorsan nedenini konuşalım."
+]
+
+MERAK = [
+    "🤔 Benim fikrimi soruyorsan, önce konunun detayını ver; beraber değerlendirelim.",
+    "👀 Merak ettim. Tam olarak neyi düşünmemi istiyorsun?",
+    "😎 Anlat, fikrimi net söyleyeyim.",
+    "🤔 Konuyu biraz açarsan daha sağlam bir yorum yapabilirim.",
+    "🧠 Detayı verirsen artılarını eksilerini beraber tartabiliriz."
+]
+
+GENEL = [
+    "👀 Anladım. Buradaki asıl detay ne, biraz açsana?",
+    "😎 Tamam, bunu aldım. Peki sen bu konuda ne düşünüyorsun?",
+    "🤔 İlginç bir nokta. Biraz daha anlatırsan konuşmayı oradan sürdürelim.",
+    "😂 Muhabbetin bir yeri eksik kaldı gibi. Devamını getir.",
+    "👀 Bunu not ettim. Şimdi merak ettiğim şey şu: sonra ne oldu?",
+    "😄 Tamam dostum, seni takip ediyorum. Biraz daha aç.",
+    "🤝 Anladım. Konuyu birlikte açabiliriz; nereden başlamak istersin?",
+    "😎 Devam et. Bu sefer kısa kesme, hikâyeyi merak ettim.",
+    "👀 Burada bir detay kaçırıyorum gibi. Bana biraz daha bağlam ver.",
+    "🤔 Bunu farklı açılardan da değerlendirebiliriz. Senin bakışın ne?",
+    "😄 Güzel, buradan bir sohbet çıkar. Sen anlatmaya devam et.",
+    "😂 Tamam, top sende. Ben dinliyorum.",
+    "👀 Hımm. Bunu duyunca aklıma birkaç şey geldi. Sen nasıl yorumluyorsun?",
+    "🤝 Anladım dostum. Bir sonraki cümlen önemli, devam et.",
+    "😎 Tamamdır. Konuyu bırakmıyorum, anlat bakalım."
+]
+
+# ---------------------------------------------------------------------------
+# NİYET TESPİTİ
+# ---------------------------------------------------------------------------
+def niyet_bul(metin):
+    low = normalize(metin)
+
+    if eslesen(low, [
+        "selam", "merhaba", "selamlar", "hey", "hello", "sa", "s a",
+        "s.a", "slm", "selamın aleyküm", "selamin aleykum"
+    ]):
+        return "selamlama"
+
+    if eslesen(low, [
+        "nasılsın", "nasilsin", "iyi misin", "iyisin", "iyisin dimi",
+        "keyifler nasıl", "keyifler nasil", "nasıl gidiyor",
+        "nasil gidiyor", "hayat nasıl", "hayat nasil", "naber",
+        "ne haber", "ne var ne yok"
+    ]):
+        return "nasilsin"
+
+    if eslesen(low, [
+        "ne yapıyorsun", "ne yapiyorsun", "napıyorsun", "napiyorsun",
+        "napıyon", "napiyon", "napiyosun", "napıyon", "noluyo",
+        "ne oluyor", "neler oluyor", "ne var"
+    ]):
+        return "gunluk"
+
+    if eslesen(low, [
+        "teşekkür", "tesekkur", "sağ ol", "sag ol", "eyvallah",
+        "eyw", "eyvallah", "adamsın", "adamsin"
+    ]):
+        return "tesekkur"
+
+    if eslesen(low, [
+        "şaka", "saka", "espri", "güldür", "guldur", "komik",
+        "beni güldür", "beni guldur"
+    ]):
+        return "espri"
+
+    if eslesen(low, [
+        "görüşürüz", "gorusuruz", "kaçtım", "kactim", "gidiyorum",
+        "sonra konuşuruz", "sonra gorusuruz", "bay bay",
+        "iyi geceler", "iyi akşamlar", "iyi aksamlar", "hoşça kal",
+        "hosca kal"
+    ]):
+        return "veda"
+
+    if eslesen(low, [
+        "cidden mi", "yok artık", "yok artik", "hadi ya", "şaka yapıyorsun",
+        "saka yapiyorsun", "harbi mi", "gerçekten mi", "gercekten mi",
+        "vay be", "oha"
+    ]):
+        return "tepki"
+
+    if eslesen(low, [
+        "aynen", "doğru", "dogru", "katılıyorum", "katiliyorum",
+        "haklısın", "haklisin", "evet aynen"
+    ]):
+        return "onay"
+
+    if eslesen(low, [
+        "yok", "hayır", "hayir", "sanmıyorum", "sanmiyorum",
+        "katılmıyorum", "katilmiyorum", "bence değil", "bence degil"
+    ]):
+        return "red"
+
+    if eslesen(low, [
+        "sence", "ne düşünüyorsun", "ne dusunuyorsun", "biliyor musun",
+        "bana anlat", "fikrin ne", "ne dersin", "sen olsan ne yapardın",
+        "sen olsan ne yapardin"
+    ]):
+        return "merak"
+
+    if eslesen(low, [
+        "canım sıkkın", "canim sikkin", "moralim bozuk",
+        "üzgünüm", "uzgunum", "kötüyüm", "kotuyum",
+        "keyfim yok", "modum düşük", "modum dusuk"
+    ]):
+        return "destek"
+
+    if eslesen(low, [
+        "sinirliyim", "sinir oldum", "delirdim", "çok kızgınım",
+        "cok kizginim", "tepem attı", "tepem atti"
+    ]):
+        return "sakin"
+
+    if eslesen(low, [
+        "çok mutluyum", "cok mutluyum", "mutluyum", "keyfim yerinde",
+        "harikayım", "harikayim"
+    ]):
+        return "mutlu"
+
+    if eslesen(low, [
+        "kimsin", "sen kimsin", "adın ne", "adin ne",
+        "ismin ne", "sen nesin"
+    ]):
+        return "kimlik"
+
+    if eslesen(low, [
+        "fal bak", "falına bak", "falina bak", "kahve falı",
+        "kahve fali"
+    ]):
+        return "fal"
+
+    if eslesen(low, [
+        "sorgu yap", "sorgulama", "sorgu", "sorgula"
+    ]):
+        return "sorgu"
+
+    if eslesen(low, [
+        "sanal no", "sanal numara", "sms", "sms numarası",
+        "sms numarasi"
+    ]):
+        return "sanal_no"
+
+    if eslesen(low, [
+        "bakiye", "param ne kadar", "hesapta ne var"
+    ]):
+        return "bakiye"
+
+    return "genel"
+
+
+# ---------------------------------------------------------------------------
+# BAĞLAMA GÖRE CEVAP
+# ---------------------------------------------------------------------------
+def gecmis_referansi(user_id):
+    gecmis = son_konusma(user_id)
+    kullanici_mesajlari = [
+        x["metin"] for x in gecmis
+        if x["rol"] == "user"
     ]
+    if len(kullanici_mesajlari) >= 2:
+        return kullanici_mesajlari[-2]
+    return ""
 
-    if seviye >= 4:
-        return "🛑 Küfürü azaltalım dostum. Takılacaksan takıl, ama karşılıklı saygıyı koruyalım. Ben yine buradayım."
-
-    return random.choice(cevaplar)
 
 def sohbet_yanit(user_id, metin):
     m = temiz_metin(metin)
-    low = m.lower()
+    low = normalize(m)
 
     if kufur_var_mi(m):
         return kufur_yanit(user_id)
 
+    niyet = niyet_bul(m)
     stil = duygu_ve_stil(m)
-    gecmis = son_konusma(user_id)
-    onceki = gecmis[-1]["metin"] if gecmis else ""
+    onceki = gecmis_referansi(user_id)
 
-    if any(x in low for x in (
-        "fal bak", "falına bak", "falina bak",
-        "kahve falı", "kahve fali"
-    )):
-        return "🔮 Fal moduna geçebiliriz. Sohbeti bırakıp direkt fal tarafına geçelim; ne tür fal istiyorsun?"
+    # Özellik geçişleri.
+    if niyet == "fal":
+        return "🔮 Fal moduna geçebiliriz. Ne tür fal istiyorsun?"
 
-    if any(x in low for x in (
-        "sorgu yap", "sorgulama", "sorgu", "sorgula"
-    )):
+    if niyet == "sorgu":
         return "🔍 Sorgulama tarafına geçebiliriz. Ne yapmak istediğini yaz, uygun menüye yönlendireyim."
 
-    if any(x in low for x in (
-        "sanal no", "sanal numara", "sms",
-        "sms numarası", "sms numarasi"
-    )):
+    if niyet == "sanal_no":
         return "📱 Sanal numara tarafına geçiyoruz. İstersen menüden 📱 Sanal No'ya dokun."
 
-    if any(x in low for x in (
-        "bakiye", "param ne kadar", "hesapta ne var"
-    )):
+    if niyet == "bakiye":
         return "💰 Bakiye kontrolü için menüden 💰 Bakiye'ye basabilirsin."
 
-    if low in (
-        "selam", "merhaba", "sa", "s.a",
-        "selamlar", "hey", "hello"
+    if niyet == "kimlik":
+        return cevap_sec(user_id, [
+            "🤖 Ben Savitar. Sohbet ederim, konuyu takip ederim ve menüdeki özelliklere yönlendiririm.",
+            "😎 Ben Savitar. Biraz sohbet, biraz mizah, gerektiğinde de menü desteği için buradayım.",
+            "🤖 Savitar benim. Muhabbet tarafında daha doğal konuşmaya çalışıyorum; konu sende."
+        ])
+
+    if niyet == "selamlama":
+        return cevap_sec(user_id, SELAMLAMA)
+
+    if niyet == "nasilsin":
+        return cevap_sec(user_id, NASILSIN)
+
+    if niyet == "gunluk":
+        return cevap_sec(user_id, GUNLUK_MUHABBET)
+
+    if niyet == "tesekkur":
+        return cevap_sec(user_id, TESEKKUR)
+
+    if niyet == "espri":
+        return cevap_sec(user_id, ESPRI)
+
+    if niyet == "veda":
+        return cevap_sec(user_id, VEDA)
+
+    if niyet == "tepki":
+        return cevap_sec(user_id, TEPKI)
+
+    if niyet == "onay":
+        return cevap_sec(user_id, ONAY)
+
+    if niyet == "red":
+        return cevap_sec(user_id, RED)
+
+    if niyet == "merak":
+        return cevap_sec(user_id, MERAK)
+
+    if niyet == "destek":
+        return cevap_sec(user_id, DESTEK)
+
+    if niyet == "sakin":
+        return cevap_sec(user_id, Sakin)
+
+    if niyet == "mutlu":
+        return cevap_sec(user_id, MUTLU)
+
+    # Soru cümlesi: tek bir "güzel soru" cevabına düşmesin.
+    if (
+        low.endswith("?")
+        or any(x in low.split() for x in (
+            "neden", "nasıl", "nasil", "ne", "ne zaman",
+            "nerede", "kim", "hangisi", "niye"
+        ))
     ):
-        return random.choice([
-            "👋 Selam dostum! Nasılsın, bugün ne karıştırıyoruz?",
-            "😎 Selam kanka! Geldin yine. Muhabbet mi, fal mı, sorgu mu?",
-            "👋 Hoş geldin reis. Ben buradayım, konu sende.",
-            "😂 Selam! Klavye çalışıyor, bot çalışıyor. Şimdi sıra sende."
-        ])
+        havuz = [
+            "🤔 Bunun net cevabı konuya bağlı. Biraz daha detay verirsen beraber açalım.",
+            "👀 Güzel, burada detay önemli. Tam olarak neyi merak ediyorsun?",
+            "😎 Konuyu biraz aç; sana doğrudan üzerinden konuşabileceğimiz bir cevap vereyim.",
+            "🧠 Bunu birkaç açıdan değerlendirebiliriz. Sen önce olayı anlat.",
+            "🤝 Soruyu aldım. Bağlamı verirsen daha isabetli cevaplayabilirim."
+        ]
+        return cevap_sec(user_id, havuz)
 
-    if any(x in low for x in (
-        "nasılsın", "nasilsin", "naber",
-        "ne haber", "napıyorsun", "napiyorsun"
-    )):
-        return random.choice([
-            "😄 İyiyim dostum, sistem ayakta. Senin keyifler nasıl?",
-            "🤖 Ben iyiyim; elektrikli ruh hâlim yerinde. Sende durumlar nasıl?",
-            "😂 Benden yana sıkıntı yok. Sen anlat, bugün modlar nasıl?"
-        ])
+    # "peki / devam / şimdi ne" gibi kısa devam mesajlarında geçmişe referans.
+    if eslesen(low, [
+        "devam", "sonra", "peki", "ee", "e şimdi", "e simdi",
+        "şimdi ne", "simdi ne", "sonra ne oldu", "anlat"
+    ]):
+        if onceki:
+            return cevap_sec(user_id, [
+                f"😎 Devam ediyoruz. Az önce “{onceki[:100]}” demiştin; oradan yürüyebiliriz.",
+                f"👀 Tamam, o konuyu bırakmıyorum. “{onceki[:100]}” kısmından devam edelim.",
+                "🤝 Tamam, kaldığımız yerden. Bir sonraki detayı anlat.",
+                "😄 Devam. Bu sefer hikâyenin sonraki kısmını merak ettim."
+            ])
+        return cevap_sec(user_id, GENEL)
 
-    if any(x in low for x in (
-        "teşekkür", "tesekkur", "sağ ol",
-        "sag ol", "eyvallah", "eyw"
-    )):
-        return random.choice([
-            "😎 Eyvallah dostum, ne demek.",
-            "🤝 Rica ederim kanka. Devam ediyoruz.",
-            "😂 Estağfurullah, görev başındayız."
-        ])
-
-    if any(x in low for x in (
-        "şaka", "saka", "espri",
-        "güldür", "guldur", "komik"
-    )):
-        return random.choice([
-            "😂 Benim espri seviyesi bazen Wi-Fi gibi: çekiyor ama ne zaman kopacağı belli değil.",
-            "🤣 Botun mizah departmanı açık. Maaş yok ama ego çok.",
-            "😏 Sana bir espri yapardım ama sistem kaynakları seni kaldırır mı emin değilim."
-        ])
-
-    if any(x in low for x in (
-        "kimsin", "sen kimsin", "adın ne", "adin ne"
-    )):
-        return "🤖 Ben Savitar. Sohbet ederim, menüdeki özelliklere yönlendiririm; gerektiğinde de lafı tatlı tatlı çeviririm."
-
-    if any(x in low for x in (
-        "canım sıkkın", "canim sikkin",
-        "moralim bozuk", "üzgünüm",
-        "uzgunum", "kötüyüm", "kotuyum"
-    )):
-        return "❤️ Canını sıkan bir şey varsa anlatabilirsin. Yargılamadan dinlerim. İstersen ciddi konuşuruz, istersen kafanı dağıtırız."
-
-    if any(x in low for x in (
-        "sinirliyim", "sinir oldum",
-        "delirdim", "çok kızgınım", "cok kizginim"
-    )):
-        return "🧊 Önce bir nefes. Ne olduysa anlat; beraber sakin sakin bakalım."
-
-    if low.endswith("?") or any(x in low for x in (
-        "neden", "nasıl", "nasil", "ne zaman",
-        "nerede", "kim", "ne yapayım", "ne yapayim"
-    )):
-        return "🤔 Güzel soru. Biraz daha detay verirsen konuya göre net cevap verebilirim. İstersen sohbeti de sürdürebiliriz."
-
-    if any(x in low for x in (
-        "devam", "sonra", "peki",
-        "ee", "e şimdi", "simdi ne"
-    )) and onceki:
-        return f"😎 Devam ediyoruz. Az önceki konuya göre söylersen: “{onceki[:120]}” üzerinden gidebiliriz."
-
+    # Duygu/stil, niyet yoksa da konuşmayı canlı tutar.
     if stil == "destekleyici":
-        return "❤️ Anladım dostum. İstersen biraz daha anlat, buradayım."
+        return cevap_sec(user_id, DESTEK)
+
+    if stil == "sakin":
+        return cevap_sec(user_id, Sakin)
+
+    if stil == "neşeli":
+        return cevap_sec(user_id, MUTLU)
 
     if stil == "esprili":
-        return random.choice([
-            "😂 Tamam, enerjiyi aldım. Muhabbeti nereye kırıyoruz?",
-            "😏 Güzel giriş. Bunun devamı varsa dökül, merak ettim.",
-            "🤣 Bu konuşma bir yere gidiyor ama direksiyon sende."
-        ])
+        return cevap_sec(user_id, ESPRI + TEPKI)
 
     if stil == "samimi":
-        return random.choice([
+        return cevap_sec(user_id, [
             "😎 Aynen kanka, anlat bakalım.",
             "🤝 Tamam dostum, seni dinliyorum.",
-            "😂 Heh, şimdi muhabbet başladı. Devam et."
+            "😂 Heh, şimdi muhabbet başladı. Devam et.",
+            "👀 Söyle aga, ne dönüyor?",
+            "😄 Tamam reis, konu sende."
         ])
 
-    return random.choice([
-        "🤖 Anladım. Devam et, seni dinliyorum.",
-        "💬 Tamam, konuyu aldım. Biraz daha anlat.",
-        "😎 Olur. Nereden devam edelim?",
-        "👀 İlginçmiş. Detayını merak ettim."
-    ])
+    return cevap_sec(user_id, GENEL)
 
+
+# ---------------------------------------------------------------------------
+# MESAJ İŞLEME
+# ---------------------------------------------------------------------------
 def mesaj_isle(message):
     if not message.text:
         return
@@ -285,17 +654,26 @@ def mesaj_isle(message):
 
     bot.reply_to(message, cevap)
 
+
+# ---------------------------------------------------------------------------
+# KOMUTLAR
+# ---------------------------------------------------------------------------
 @bot.message_handler(commands=["start"])
 def start(message):
     SOHBET_HAFIZASI[message.from_user.id].clear()
+    SON_CEVAPLAR[message.from_user.id].clear()
+    KUFUR_UYARILARI[message.from_user.id] = 0
 
     text = """🤖 Bot aktif!
 
-Artık daha doğal sohbet edebilirim:
-💬 Muhabbet ve bağlam
-😂 Şaka ve espri
+Daha doğal sohbet sistemi hazır:
+💬 Bağlamlı muhabbet
+🧠 Kısa süreli konuşma hafızası
+🔄 Tekrarlı cevap azaltma
+😂 Mizah ve tepki çeşitliliği
 ❤️ Duyguya göre cevap
 🎭 Konuşma tarzına uyum
+🤬 Küfür/argo karşılığı
 🔮 Fal / 🔍 Sorgulama geçişleri
 
 Aşağıdaki menüden bir özellik seçebilirsin."""
@@ -306,6 +684,7 @@ Aşağıdaki menüden bir özellik seçebilirsin."""
         reply_markup=ana_menu()
     )
 
+
 @bot.message_handler(commands=["id"])
 def user_id(message):
     bot.reply_to(
@@ -313,18 +692,19 @@ def user_id(message):
         f"🆔 Telegram ID: {message.from_user.id}"
     )
 
+
 @bot.message_handler(commands=["help"])
 def help_command(message):
     text = """❓ Yardım
 
-💬 Sohbet — Doğal sohbet, kısa bağlam hafızası, espri ve duygu uyumu.
-📱 Sanal No — SMS Virtual hesabı için güvenli durum menüsü.
+💬 Sohbet — Doğal sohbet, bağlam hafızası, çeşitli cevaplar ve duygu uyumu.
+📱 Sanal No — SMS Virtual hesabı için durum menüsü.
 💰 Bakiye — SMS Virtual hesap bakiyesini kontrol eder.
 👤 Telegram ID — Telegram kullanıcı ID'nizi gösterir.
 
 Komutlar: /start /id /help
 
-Not: Küfür/argo tespitinde sohbeti kavga moduna çevirmeden uyarırım."""
+Not: Küfür/argo tespitinde bot küfür etmeden, üsluba uygun şekilde karşılık verir."""
 
     bot.send_message(
         message.chat.id,
@@ -332,13 +712,19 @@ Not: Küfür/argo tespitinde sohbeti kavga moduna çevirmeden uyarırım."""
         reply_markup=ana_menu()
     )
 
+
+# ---------------------------------------------------------------------------
+# MENÜ
+# ---------------------------------------------------------------------------
 @bot.message_handler(func=lambda message: message.text == "👤 Telegram ID")
 def menu_id(message):
     user_id(message)
 
+
 @bot.message_handler(func=lambda message: message.text == "❓ Yardım")
 def menu_help(message):
     help_command(message)
+
 
 @bot.message_handler(func=lambda message: message.text == "💰 Bakiye")
 def balance(message):
@@ -353,7 +739,6 @@ def balance(message):
 
     if isinstance(data, dict):
         profile = data.get("data", data)
-
         if not isinstance(profile, dict):
             profile = data.get("profile", data)
     else:
@@ -370,6 +755,7 @@ def balance(message):
         f"💰 SMS Virtual bakiye: {value}"
     )
 
+
 @bot.message_handler(func=lambda message: message.text == "📱 Sanal No")
 def virtual_number(message):
     text = """📱 Sanal Numara
@@ -382,17 +768,26 @@ Numara satın alma veya doğrulama işlemi otomatikleştirilmemiştir."""
         text
     )
 
+
 @bot.message_handler(func=lambda message: message.text == "💬 Sohbet")
 def chat_mode(message):
     bot.reply_to(
         message,
-        "💬 Sohbet moduna geçtik. Ne konuşmak istersen yaz; bağlamı birkaç mesaj boyunca koruyacağım."
+        "💬 Sohbet moduna geçtik. Ne konuşmak istersen yaz; yakın konuşmaları dikkate alıp aynı cevabı tekrar etmemeye çalışacağım."
     )
 
+
+# ---------------------------------------------------------------------------
+# GENEL MESAJ
+# ---------------------------------------------------------------------------
 @bot.message_handler(func=lambda message: True)
 def text_handler(message):
     mesaj_isle(message)
 
+
+# ---------------------------------------------------------------------------
+# TELEGRAM BAĞLANTISI / POLLING
+# ---------------------------------------------------------------------------
 try:
     print("[BOOT 4] TeleBot olusturuldu", flush=True)
 
@@ -418,7 +813,7 @@ try:
         )
 
     print(
-        "[BOOT 7] Gelistirilmis sohbet sistemi hazir",
+        "[BOOT 7] Yeni sohbet sistemi hazir",
         flush=True
     )
 
@@ -427,8 +822,7 @@ try:
         flush=True
     )
 
-    # Tek bir polling sahibi olsun.
-    # infinity_polling kendi yeniden deneme mekanizmasına sahiptir.
+    # Railway üzerinde tek polling sahibi olacak şekilde çalışır.
     bot.infinity_polling(
         skip_pending=False,
         timeout=30,
