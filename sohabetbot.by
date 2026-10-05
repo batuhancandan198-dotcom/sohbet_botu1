@@ -8,12 +8,23 @@ from collections import defaultdict, deque
 print("[BOOT 1] main.py basladi", flush=True)
 
 RAW_TOKEN = os.getenv("BOT_TOKEN", "")
-# Railway değişkenine yanlışlıkla boşluk/tırnak yapıştırılması 401'e yol açabilir.
-TOKEN = RAW_TOKEN.strip().strip('"').strip("'").strip()
-if not TOKEN:
+if not RAW_TOKEN:
     raise RuntimeError("BOT_TOKEN Railway Variables içinde tanımlı değil.")
 
-print("[BOOT 2] BOT_TOKEN mevcut", flush=True)
+# Railway'e bazen token yerine "BOT_TOKEN=..." veya tırnaklı değer
+# yapıştırılabiliyor. Telegram tokenında boşluk bulunamaz.
+TOKEN = RAW_TOKEN.strip()
+if TOKEN.lower().startswith("bot_token="):
+    TOKEN = TOKEN.split("=", 1)[1].strip()
+TOKEN = TOKEN.strip('"').strip("'").strip()
+
+if any(ch.isspace() for ch in TOKEN) or TOKEN.count(":") != 1:
+    raise RuntimeError("BOT_TOKEN biçimi geçersiz: yalnızca BotFather token değerini girin (ör. 123456789:AA...).")
+
+print(
+    f"[BOOT 2] BOT_TOKEN mevcut | format=ok | length={len(TOKEN)} | prefix={TOKEN.split(':', 1)[0]}",
+    flush=True
+)
 
 try:
     import telebot
