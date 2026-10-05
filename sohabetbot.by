@@ -1,782 +1,133 @@
 import os
 import sys
+import time
+import hashlib
 import traceback
-import random
-import re
 from collections import defaultdict, deque
 
-print("[BOOT 1] main.py basladi", flush=True)
+VERSION = "SAVITAR-FRESH-2026-10-05"
+print(f"[FRESH 1] {VERSION} basladi", flush=True)
 
 RAW_TOKEN = os.getenv("BOT_TOKEN", "")
 if not RAW_TOKEN:
     raise RuntimeError("BOT_TOKEN Railway Variables içinde tanımlı değil.")
 
-# Railway'e bazen token yerine "BOT_TOKEN=..." veya tırnaklı değer
-# yapıştırılabiliyor. Telegram tokenında boşluk bulunamaz.
 TOKEN = RAW_TOKEN.strip()
 if TOKEN.lower().startswith("bot_token="):
     TOKEN = TOKEN.split("=", 1)[1].strip()
 TOKEN = TOKEN.strip('"').strip("'").strip()
 
 if any(ch.isspace() for ch in TOKEN) or TOKEN.count(":") != 1:
-    raise RuntimeError("BOT_TOKEN biçimi geçersiz: yalnızca BotFather token değerini girin (ör. 123456789:AA...).")
+    raise RuntimeError("BOT_TOKEN biçimi geçersiz.")
+
+fingerprint = hashlib.sha256(TOKEN.encode()).hexdigest()[:12]
+prefix = TOKEN.split(":", 1)[0]
 
 print(
-    f"[BOOT 2] BOT_TOKEN mevcut | format=ok | length={len(TOKEN)} | prefix={TOKEN.split(':', 1)[0]}",
-    flush=True
+    f"[FRESH 2] token format=ok length={len(TOKEN)} prefix={prefix} fingerprint={fingerprint}",
+    flush=True,
 )
 
 try:
     import telebot
     from telebot import types
-    print("[BOOT 3] telebot import edildi", flush=True)
+    print("[FRESH 3] telebot import OK", flush=True)
 except Exception as exc:
-    print(f"[BOOT 3] telebot import HATASI: {type(exc).__name__}: {exc}", flush=True)
+    print(f"[FRESH 3] telebot import ERROR: {exc}", flush=True)
     traceback.print_exc()
     sys.exit(1)
 
 bot = telebot.TeleBot(TOKEN)
+memory = defaultdict(lambda: deque(maxlen=10))
+
+MENU = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+MENU.add(
+    types.KeyboardButton("💬 Sohbet"),
+    types.KeyboardButton("👤 Telegram ID"),
+    types.KeyboardButton("❓ Yardım"),
+)
+
+def reply(message, text):
+    memory[message.from_user.id].append(("bot", text))
+    bot.reply_to(message, text)
 
-# ---------------------------------------------------------------------------
-# SOHBET HAFIZASI
-# ---------------------------------------------------------------------------
-# Her kullanıcı için son 12 konuşma turunu tutar.
-# Railway yeniden başlatılırsa RAM belleği sıfırlanır.
-SOHBET_HAFIZASI = defaultdict(lambda: deque(maxlen=12))
-KUFUR_UYARILARI = defaultdict(int)
-SON_CEVAPLAR = defaultdict(lambda: deque(maxlen=8))
-
-# ---------------------------------------------------------------------------
-# KUFUR / HAKARET TESPITI
-# Bot kendi cevabında küfür kullanmaz.
-# ---------------------------------------------------------------------------
-KUFUR_KELIMELERI = {
-    "amk", "aq", "a.q", "mk", "m.k", "siktir", "sikeyim", "sikik",
-    "sik", "orospu", "oç", "oc", "piç", "pezevenk", "yarrak", "yarak",
-    "salak", "gerizekali", "gerizekalı", "aptal", "mal", "eşşek", "esek",
-    "ananı", "anani", "anan", "göt", "got", "ibne", "kahpe", "dangalak",
-    "şerefsiz", "serefsiz", "haysiyetsiz", "puşt", "pust", "bok",
-    "boktan", "sikikçe", "siktirgit", "siktir git"
-}
-
-# ---------------------------------------------------------------------------
-# ANA MENÜ
-# ---------------------------------------------------------------------------
-def ana_menu():
-    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    markup.add(
-        types.KeyboardButton("📱 Sanal No"),
-        types.KeyboardButton("💬 Sohbet"),
-        types.KeyboardButton("👤 Telegram ID"),
-        types.KeyboardButton("❓ Yardım"),
-    )
-    return markup
-
-
-# ---------------------------------------------------------------------------
-# METİN YARDIMCILARI
-# ---------------------------------------------------------------------------
-def temiz_metin(metin):
-    return re.sub(r"\s+", " ", (metin or "").strip())
-
-
-def normalize(metin):
-    m = temiz_metin(metin).lower()
-    # Noktalama ve günlük yazım farklılıklarını biraz daha rahat yakala.
-    m = m.replace("’", "'").replace("ı", "i")
-    m = re.sub(r"[^\w\s']", " ", m, flags=re.UNICODE)
-    m = re.sub(r"\s+", " ", m).strip()
-    return m
-
-
-def kelimeler(metin):
-    return re.findall(r"[a-zçğıöşü0-9']+", (metin or "").lower())
-
-
-def kufur_var_mi(metin):
-    low = normalize(metin)
-    return any(k in low.split() for k in KUFUR_KELIMELERI)
-
-
-def son_konusma(user_id):
-    return list(SOHBET_HAFIZASI[user_id])
-
-
-def hafizaya_ekle(user_id, rol, metin):
-    SOHBET_HAFIZASI[user_id].append({
-        "rol": rol,
-        "metin": temiz_metin(metin)[:600]
-    })
-
-
-def cevap_sec(user_id, havuz):
-    """
-    Son kullanılan cevapları mümkün olduğunca tekrar etmez.
-    Havuz çok küçükse yine güvenli şekilde seçim yapar.
-    """
-    if not havuz:
-        return "Buradayım dostum. Konuyu biraz aç, beraber devam edelim."
-
-    son = set(SON_CEVAPLAR[user_id])
-    uygun = [x for x in havuz if x not in son]
-
-    secilen = random.choice(uygun or havuz)
-    SON_CEVAPLAR[user_id].append(secilen)
-    return secilen
-
-
-def eslesen(metin, ifadeler):
-    low = normalize(metin)
-    return any(normalize(x) in low for x in ifadeler)
-
-
-# ---------------------------------------------------------------------------
-# DUYGU / KONU / KONUŞMA TARZI
-# ---------------------------------------------------------------------------
-def duygu_ve_stil(metin):
-    low = normalize(metin)
-    raw = metin or ""
-
-    heyecan = (
-        "!" in raw
-        or "haha" in low
-        or "ahah" in low
-        or "lol" in low
-        or "😂" in raw
-        or "🤣" in raw
-    )
-
-    uzgun = eslesen(low, [
-        "üzgünüm", "uzgunum", "moralim bozuk", "canım sıkkın",
-        "canim sikkin", "kötüyüm", "kotuyum", "berbatım",
-        "berbatim", "keyfim yok", "modum düşük", "modum dusuk",
-        "içim sıkılıyor", "icim sikiliyor"
-    ])
-
-    kizgin = eslesen(low, [
-        "sinirliyim", "sinir oldum", "delirdim", "çok kızgınım",
-        "cok kizginim", "tepem attı", "tepem atti", "çok sinirlendim"
-    ])
-
-    mutlu = eslesen(low, [
-        "çok mutluyum", "cok mutluyum", "mutluyum", "keyfim yerinde",
-        "çok iyiyim", "cok iyiyim", "harikayım", "harikayim",
-        "bugün çok iyi", "bugun cok iyi"
-    ])
-
-    saka = eslesen(low, [
-        "şaka", "saka", "haha", "ahah", "lol", "espri", "güldür",
-        "guldur", "komik"
-    ])
-
-    samimi = eslesen(low, [
-        "kanka", "dostum", "bro", "aga", "abi", "reis", "hocam",
-        "moruk", "kardeşim", "kardesim"
-    ])
-
-    if uzgun:
-        return "destekleyici"
-    if kizgin:
-        return "sakin"
-    if mutlu:
-        return "neşeli"
-    if saka or heyecan:
-        return "esprili"
-    if samimi:
-        return "samimi"
-    return "normal"
-
-
-# ---------------------------------------------------------------------------
-# KUFUR CEVAPLARI
-# ---------------------------------------------------------------------------
-def kufur_yanit(user_id):
-    KUFUR_UYARILARI[user_id] += 1
-    seviye = KUFUR_UYARILARI[user_id]
-
-    if seviye >= 5:
-        havuz = [
-            "🛑 Tamam dostum, sertliği biraz azaltalım. Takılacaksan takıl ama muhabbeti seviyeyi düşürmeden sürdürelim.",
-            "😏 Üslubu toparlayalım. Ben buradayım; düzgün konuşursan muhabbet de daha iyi akar.",
-            "🙂 Sinirini anlıyorum ama küfürü azaltalım. Ne olduysa anlat, konuya bakalım."
-        ]
-    elif seviye >= 3:
-        havuz = [
-            "😏 Bu tonla soru sorunca cevaptan çok üslubun dikkat çekiyor. Bir daha dene.",
-            "🧊 Sakin ol şampiyon, klavyeye bu kadar yüklenmene gerek yok. Ne konuşuyorduk?",
-            "Bana ne mi? Önce üslubunu toparla, sonra konuşuruz. 😏",
-            "😂 Gazı biraz keselim dostum. Lafı sertleştirmek yerine derdini anlat, oradan yürüyelim."
-        ]
-    else:
-        havuz = [
-            "😏 Ooo, dil biraz vites yükseltti. Sakin ol reis, bana sökmez.",
-            "😂 Küfür kontenjanını doldurma. Düzgün konuş da muhabbet akıp gitsin.",
-            "😎 Klavyenin gazını biraz keselim. Lafı bana değil konuya çak.",
-            "🙃 Sert girdin ama ben kavga moduna geçmem. Bir daha dene, bu kez düzgün muhabbet edelim.",
-            "😏 Küfürü bir kenara bırakalım. Söyle bakalım, asıl mesele ne?"
-        ]
-
-    return cevap_sec(user_id, havuz)
-
-
-# ---------------------------------------------------------------------------
-# KONUŞMA HAVUZLARI
-# ---------------------------------------------------------------------------
-SELAMLAMA = [
-    "👋 Selam dostum! Geldin yine. Bugün ne konuşuyoruz?",
-    "😎 Selam kanka! Ben buradayım. Sende ne var ne yok?",
-    "👋 Hoş geldin reis. Konu sende, ben dinliyorum.",
-    "😂 Selam! Sistemler açık, muhabbet servisi hazır. Ne anlatıyorsun?",
-    "🤝 Selam dostum. Bugün modlar nasıl?",
-    "😄 Selamlar! Hadi bakalım, bu sefer hangi konuyla geldin?",
-    "👀 Selam! Seni gördük, şimdi merak ettim: ne konuşacağız?",
-    "😎 Hey! Muhabbet kapısı açık. Dökül bakalım."
-]
-
-NASILSIN = [
-    "😄 İyiyim dostum, sistemler sağlam. Asıl sen nasılsın?",
-    "🤖 Benden yana durumlar iyi. Dijital ruh hâlim yerinde; sende hayat nasıl?",
-    "😂 Ben iyiyim, elektrikli ruh hâlim stabil. Senin keyifler nasıl?",
-    "😎 Gayet iyiyim. Sen bugün iyi misin, yoksa anlatacak bir hikâyen mi var?",
-    "🤝 İyiyim dostum. Ama asıl seni merak ettim, günün nasıl geçiyor?",
-    "👀 Bende sıkıntı yok. Senin tarafta neler oluyor?",
-    "😄 Fena değilim. Hatta sohbet edecek birini bekliyordum. Senin mod kaç?",
-    "😂 Ben hazır kıta bekliyorum. Senin keyifler yerinde mi?"
-]
-
-GUNLUK_MUHABBET = [
-    "😎 Buradayım, muhabbet modundayım. Sende ne var ne yok?",
-    "😂 Şimdilik dijital mesai devam ediyor. Sen neler yapıyorsun?",
-    "👀 Ben buradayım. Asıl sen ne karıştırıyorsun?",
-    "🤖 Sistemler çalışıyor, ben de sohbet peşindeyim. Gün nasıl gidiyor?",
-    "😄 Çok büyük olaylar yok. Sen anlat, bugün neler oldu?",
-    "😎 Rutin dijital hayat işte. Ama sen gelince muhabbet hareketlendi.",
-    "🤝 Buradayım dostum. Konuyu sen seç, oradan yürüyelim."
-]
-
-TESEKKUR = [
-    "😎 Eyvallah dostum, ne demek.",
-    "🤝 Rica ederim kanka. Her zaman.",
-    "😂 Estağfurullah, görev başındayız.",
-    "😄 Ne demek dostum. Devam ediyoruz.",
-    "🫡 Lafı bile olmaz. Başka neye bakalım?",
-    "🤝 Her zaman. Şimdi sıradaki konu ne?"
-]
-
-ESPRI = [
-    "😂 Benim espri seviyesi bazen Wi-Fi gibi: çekiyor ama ne zaman kopacağı belli değil.",
-    "🤣 Botun mizah departmanı açık. Maaş yok ama ego çok.",
-    "😏 Sana bir espri yapardım ama sistem kaynakları seni kaldırır mı emin değilim.",
-    "😂 Bugün mizah departmanı fazla mesai yapıyor. Hazır ol.",
-    "🤣 Ciddiyet bekliyorsan yanlış kapıdasın. Ama kötü espri konusunda oldukça istikrarlıyım.",
-    "😎 Espri istedin, sorumluluk artık sende. Gülmezsen sistemi suçlama."
-]
-
-DESTEK = [
-    "❤️ Canını sıkan bir şey varsa anlatabilirsin. Yargılamadan dinlerim.",
-    "🫂 Anladım dostum. İstersen biraz daha anlat, birlikte toparlayalım.",
-    "❤️ Böyle hissetmen normal. Ne olduğunu anlatmak istersen buradayım.",
-    "🤝 Önce bir sakinleşelim. Sonra ne olduğunu beraber konuşuruz.",
-    "🧠 Kafanda çok şey dönüyorsa tek tek anlatabilirsin. Acelemiz yok."
-]
-
-Sakin = [
-    "🧊 Önce bir nefes. Ne olduysa anlat; beraber sakin sakin bakalım.",
-    "🤝 Sinirlenmen anlaşılır. Ama önce olayı bir anlat, beraber değerlendirelim.",
-    "😌 Tamam, önce frene basalım. Sonra neye kızdığını konuşuruz.",
-    "🧠 Bir dakika durup olayı parçalayalım. Ne oldu?"
-]
-
-MUTLU = [
-    "🔥 İşte bunu duymak güzel! Ne oldu da keyfin böyle yerine geldi?",
-    "😄 Güzel! Enerjin buraya kadar geldi. Anlatsana, ne oldu?",
-    "🥳 İşte böyle! Mutluluğun sebebi ne, merak ettim.",
-    "😎 Mod yüksek belli. Bunun hikâyesini dinlemek isterim.",
-    "😂 Nihayet güzel haber! Dökül bakalım, ne yaşandı?"
-]
-
-TEPKI = [
-    "👀 Aynen, olay biraz beklenmedikmiş. Devamı ne?",
-    "😂 Ben de tam orada bir durup düşündüm. Sonra ne oldu?",
-    "😏 İşte şimdi merak ettim. Biraz daha anlat.",
-    "🤣 Yok artık seviyesine geldiysek hikâye ciddi ilginçleşti.",
-    "👀 Cidden mi? Detayını kaçırma, anlat.",
-    "😄 Hadi ya! Bunun devamı varsa dinliyorum."
-]
-
-VEDA = [
-    "👋 Görüşürüz dostum. Yine gel, muhabbet yarım kalmasın.",
-    "🤝 Tamamdır kanka, sonra devam ederiz. Kendine iyi bak.",
-    "😎 Kaç bakalım. Ama geri dönmeyi unutma.",
-    "👋 Görüşürüz reis. Bir dahaki gelişinde kaldığımız yerden.",
-    "🌙 İyi geceler dostum. Kafan rahat olsun, sonra konuşuruz.",
-    "🤝 Hadi kendine iyi bak. Muhabbet burada bitmedi."
-]
-
-ONAY = [
-    "😎 Aynen, ben de öyle düşünüyorum.",
-    "🤝 Katılıyorum. Mantıklı bir nokta.",
-    "👀 Evet, burada dediğinde bir şey var.",
-    "😄 Aynen öyle. Devamını da merak ettim.",
-    "👍 Doğru. Bunun üstünden biraz daha gidebiliriz."
-]
-
-RED = [
-    "🤔 Olabilir. Neden öyle düşündüğünü merak ettim.",
-    "👀 Tamam, sen öyle görüyorsun. Biraz açarsan fikrini daha iyi anlayabilirim.",
-    "😄 Peki, karşı tarafı da dinledik. Senin gerekçen ne?",
-    "🤝 Tamamdır. Katılmıyorsan nedenini konuşalım."
-]
-
-MERAK = [
-    "🤔 Benim fikrimi soruyorsan, önce konunun detayını ver; beraber değerlendirelim.",
-    "👀 Merak ettim. Tam olarak neyi düşünmemi istiyorsun?",
-    "😎 Anlat, fikrimi net söyleyeyim.",
-    "🤔 Konuyu biraz açarsan daha sağlam bir yorum yapabilirim.",
-    "🧠 Detayı verirsen artılarını eksilerini beraber tartabiliriz."
-]
-
-GENEL = [
-    "👀 Anladım. Buradaki asıl detay ne, biraz açsana?",
-    "😎 Tamam, bunu aldım. Peki sen bu konuda ne düşünüyorsun?",
-    "🤔 İlginç bir nokta. Biraz daha anlatırsan konuşmayı oradan sürdürelim.",
-    "😂 Muhabbetin bir yeri eksik kaldı gibi. Devamını getir.",
-    "👀 Bunu not ettim. Şimdi merak ettiğim şey şu: sonra ne oldu?",
-    "😄 Tamam dostum, seni takip ediyorum. Biraz daha aç.",
-    "🤝 Anladım. Konuyu birlikte açabiliriz; nereden başlamak istersin?",
-    "😎 Devam et. Bu sefer kısa kesme, hikâyeyi merak ettim.",
-    "👀 Burada bir detay kaçırıyorum gibi. Bana biraz daha bağlam ver.",
-    "🤔 Bunu farklı açılardan da değerlendirebiliriz. Senin bakışın ne?",
-    "😄 Güzel, buradan bir sohbet çıkar. Sen anlatmaya devam et.",
-    "😂 Tamam, top sende. Ben dinliyorum.",
-    "👀 Hımm. Bunu duyunca aklıma birkaç şey geldi. Sen nasıl yorumluyorsun?",
-    "🤝 Anladım dostum. Bir sonraki cümlen önemli, devam et.",
-    "😎 Tamamdır. Konuyu bırakmıyorum, anlat bakalım."
-]
-
-# ---------------------------------------------------------------------------
-# NİYET TESPİTİ
-# ---------------------------------------------------------------------------
-def niyet_bul(metin):
-    low = normalize(metin)
-
-    if eslesen(low, [
-        "selam", "merhaba", "selamlar", "hey", "hello", "sa", "s a",
-        "s.a", "slm", "selamın aleyküm", "selamin aleykum"
-    ]):
-        return "selamlama"
-
-    if eslesen(low, [
-        "nasılsın", "nasilsin", "iyi misin", "iyisin", "iyisin dimi",
-        "keyifler nasıl", "keyifler nasil", "nasıl gidiyor",
-        "nasil gidiyor", "hayat nasıl", "hayat nasil", "naber",
-        "ne haber", "ne var ne yok"
-    ]):
-        return "nasilsin"
-
-    if eslesen(low, [
-        "ne yapıyorsun", "ne yapiyorsun", "napıyorsun", "napiyorsun",
-        "napıyon", "napiyon", "napiyosun", "napıyon", "noluyo",
-        "ne oluyor", "neler oluyor", "ne var"
-    ]):
-        return "gunluk"
-
-    if eslesen(low, [
-        "teşekkür", "tesekkur", "sağ ol", "sag ol", "eyvallah",
-        "eyw", "eyvallah", "adamsın", "adamsin"
-    ]):
-        return "tesekkur"
-
-    if eslesen(low, [
-        "şaka", "saka", "espri", "güldür", "guldur", "komik",
-        "beni güldür", "beni guldur"
-    ]):
-        return "espri"
-
-    if eslesen(low, [
-        "görüşürüz", "gorusuruz", "kaçtım", "kactim", "gidiyorum",
-        "sonra konuşuruz", "sonra gorusuruz", "bay bay",
-        "iyi geceler", "iyi akşamlar", "iyi aksamlar", "hoşça kal",
-        "hosca kal"
-    ]):
-        return "veda"
-
-    if eslesen(low, [
-        "cidden mi", "yok artık", "yok artik", "hadi ya", "şaka yapıyorsun",
-        "saka yapiyorsun", "harbi mi", "gerçekten mi", "gercekten mi",
-        "vay be", "oha"
-    ]):
-        return "tepki"
-
-    if eslesen(low, [
-        "aynen", "doğru", "dogru", "katılıyorum", "katiliyorum",
-        "haklısın", "haklisin", "evet aynen"
-    ]):
-        return "onay"
-
-    if eslesen(low, [
-        "yok", "hayır", "hayir", "sanmıyorum", "sanmiyorum",
-        "katılmıyorum", "katilmiyorum", "bence değil", "bence degil"
-    ]):
-        return "red"
-
-    if eslesen(low, [
-        "sence", "ne düşünüyorsun", "ne dusunuyorsun", "biliyor musun",
-        "bana anlat", "fikrin ne", "ne dersin", "sen olsan ne yapardın",
-        "sen olsan ne yapardin"
-    ]):
-        return "merak"
-
-    if eslesen(low, [
-        "canım sıkkın", "canim sikkin", "moralim bozuk",
-        "üzgünüm", "uzgunum", "kötüyüm", "kotuyum",
-        "keyfim yok", "modum düşük", "modum dusuk"
-    ]):
-        return "destek"
-
-    if eslesen(low, [
-        "sinirliyim", "sinir oldum", "delirdim", "çok kızgınım",
-        "cok kizginim", "tepem attı", "tepem atti"
-    ]):
-        return "sakin"
-
-    if eslesen(low, [
-        "çok mutluyum", "cok mutluyum", "mutluyum", "keyfim yerinde",
-        "harikayım", "harikayim"
-    ]):
-        return "mutlu"
-
-    if eslesen(low, [
-        "kimsin", "sen kimsin", "adın ne", "adin ne",
-        "ismin ne", "sen nesin"
-    ]):
-        return "kimlik"
-
-    if eslesen(low, [
-        "fal bak", "falına bak", "falina bak", "kahve falı",
-        "kahve fali"
-    ]):
-        return "fal"
-
-    if eslesen(low, [
-        "sorgu yap", "sorgulama", "sorgu", "sorgula"
-    ]):
-        return "sorgu"
-
-    if eslesen(low, [
-        "sanal no", "sanal numara", "sms", "sms numarası",
-        "sms numarasi"
-    ]):
-        return "sanal_no"
-
-    return "genel"
-
-
-# ---------------------------------------------------------------------------
-# BAĞLAMA GÖRE CEVAP
-# ---------------------------------------------------------------------------
-def gecmis_referansi(user_id):
-    gecmis = son_konusma(user_id)
-    kullanici_mesajlari = [
-        x["metin"] for x in gecmis
-        if x["rol"] == "user"
-    ]
-    if len(kullanici_mesajlari) >= 2:
-        return kullanici_mesajlari[-2]
-    return ""
-
-
-def sohbet_yanit(user_id, metin):
-    m = temiz_metin(metin)
-    low = normalize(m)
-
-    if kufur_var_mi(m):
-        return kufur_yanit(user_id)
-
-    niyet = niyet_bul(m)
-    stil = duygu_ve_stil(m)
-    onceki = gecmis_referansi(user_id)
-
-    # Özellik geçişleri.
-    if niyet == "fal":
-        return "🔮 Fal moduna geçebiliriz. Ne tür fal istiyorsun?"
-
-    if niyet == "sorgu":
-        return "🔍 Sorgulama tarafına geçebiliriz. Ne yapmak istediğini yaz, uygun menüye yönlendireyim."
-
-    if niyet == "sanal_no":
-        return "📱 Sanal numara tarafına geçiyoruz. İstersen menüden 📱 Sanal No'ya dokun."
-
-    if niyet == "kimlik":
-        return cevap_sec(user_id, [
-            "🤖 Ben Savitar. Sohbet ederim, konuyu takip ederim ve menüdeki özelliklere yönlendiririm.",
-            "😎 Ben Savitar. Biraz sohbet, biraz mizah, gerektiğinde de menü desteği için buradayım.",
-            "🤖 Savitar benim. Muhabbet tarafında daha doğal konuşmaya çalışıyorum; konu sende."
-        ])
-
-    if niyet == "selamlama":
-        return cevap_sec(user_id, SELAMLAMA)
-
-    if niyet == "nasilsin":
-        return cevap_sec(user_id, NASILSIN)
-
-    if niyet == "gunluk":
-        return cevap_sec(user_id, GUNLUK_MUHABBET)
-
-    if niyet == "tesekkur":
-        return cevap_sec(user_id, TESEKKUR)
-
-    if niyet == "espri":
-        return cevap_sec(user_id, ESPRI)
-
-    if niyet == "veda":
-        return cevap_sec(user_id, VEDA)
-
-    if niyet == "tepki":
-        return cevap_sec(user_id, TEPKI)
-
-    if niyet == "onay":
-        return cevap_sec(user_id, ONAY)
-
-    if niyet == "red":
-        return cevap_sec(user_id, RED)
-
-    if niyet == "merak":
-        return cevap_sec(user_id, MERAK)
-
-    if niyet == "destek":
-        return cevap_sec(user_id, DESTEK)
-
-    if niyet == "sakin":
-        return cevap_sec(user_id, Sakin)
-
-    if niyet == "mutlu":
-        return cevap_sec(user_id, MUTLU)
-
-    # Soru cümlesi: tek bir "güzel soru" cevabına düşmesin.
-    if (
-        low.endswith("?")
-        or any(x in low.split() for x in (
-            "neden", "nasıl", "nasil", "ne", "ne zaman",
-            "nerede", "kim", "hangisi", "niye"
-        ))
-    ):
-        havuz = [
-            "🤔 Bunun net cevabı konuya bağlı. Biraz daha detay verirsen beraber açalım.",
-            "👀 Güzel, burada detay önemli. Tam olarak neyi merak ediyorsun?",
-            "😎 Konuyu biraz aç; sana doğrudan üzerinden konuşabileceğimiz bir cevap vereyim.",
-            "🧠 Bunu birkaç açıdan değerlendirebiliriz. Sen önce olayı anlat.",
-            "🤝 Soruyu aldım. Bağlamı verirsen daha isabetli cevaplayabilirim."
-        ]
-        return cevap_sec(user_id, havuz)
-
-    # "peki / devam / şimdi ne" gibi kısa devam mesajlarında geçmişe referans.
-    if eslesen(low, [
-        "devam", "sonra", "peki", "ee", "e şimdi", "e simdi",
-        "şimdi ne", "simdi ne", "sonra ne oldu", "anlat"
-    ]):
-        if onceki:
-            return cevap_sec(user_id, [
-                f"😎 Devam ediyoruz. Az önce “{onceki[:100]}” demiştin; oradan yürüyebiliriz.",
-                f"👀 Tamam, o konuyu bırakmıyorum. “{onceki[:100]}” kısmından devam edelim.",
-                "🤝 Tamam, kaldığımız yerden. Bir sonraki detayı anlat.",
-                "😄 Devam. Bu sefer hikâyenin sonraki kısmını merak ettim."
-            ])
-        return cevap_sec(user_id, GENEL)
-
-    # Duygu/stil, niyet yoksa da konuşmayı canlı tutar.
-    if stil == "destekleyici":
-        return cevap_sec(user_id, DESTEK)
-
-    if stil == "sakin":
-        return cevap_sec(user_id, Sakin)
-
-    if stil == "neşeli":
-        return cevap_sec(user_id, MUTLU)
-
-    if stil == "esprili":
-        return cevap_sec(user_id, ESPRI + TEPKI)
-
-    if stil == "samimi":
-        return cevap_sec(user_id, [
-            "😎 Aynen kanka, anlat bakalım.",
-            "🤝 Tamam dostum, seni dinliyorum.",
-            "😂 Heh, şimdi muhabbet başladı. Devam et.",
-            "👀 Söyle aga, ne dönüyor?",
-            "😄 Tamam reis, konu sende."
-        ])
-
-    return cevap_sec(user_id, GENEL)
-
-
-# ---------------------------------------------------------------------------
-# MESAJ İŞLEME
-# ---------------------------------------------------------------------------
-def mesaj_isle(message):
-    if not message.text:
-        return
-
-    user_id = message.from_user.id
-    metin = temiz_metin(message.text)
-
-    hafizaya_ekle(user_id, "user", metin)
-
-    cevap = sohbet_yanit(user_id, metin)
-
-    hafizaya_ekle(user_id, "bot", cevap)
-
-    bot.reply_to(message, cevap)
-
-
-# ---------------------------------------------------------------------------
-# KOMUTLAR
-# ---------------------------------------------------------------------------
 @bot.message_handler(commands=["start"])
 def start(message):
-    SOHBET_HAFIZASI[message.from_user.id].clear()
-    SON_CEVAPLAR[message.from_user.id].clear()
-    KUFUR_UYARILARI[message.from_user.id] = 0
-
-    text = """🤖 Bot aktif!
-
-Daha doğal sohbet sistemi hazır:
-💬 Bağlamlı muhabbet
-🧠 Kısa süreli konuşma hafızası
-🔄 Tekrarlı cevap azaltma
-😂 Mizah ve tepki çeşitliliği
-❤️ Duyguya göre cevap
-🎭 Konuşma tarzına uyum
-🤬 Küfür/argo karşılığı
-🔮 Fal / 🔍 Sorgulama geçişleri
-
-Aşağıdaki menüden bir özellik seçebilirsin."""
-
-    bot.send_message(
-        message.chat.id,
-        text,
-        reply_markup=ana_menu()
+    memory[message.from_user.id].clear()
+    text = (
+        "🤖 Savitar aktif!\n\n"
+        "💬 Sohbet için mesaj yaz.\n"
+        "👤 Telegram ID için /id\n"
+        "❓ Yardım için /help"
     )
-
+    bot.send_message(message.chat.id, text, reply_markup=MENU)
 
 @bot.message_handler(commands=["id"])
 def user_id(message):
-    bot.reply_to(
-        message,
-        f"🆔 Telegram ID: {message.from_user.id}"
-    )
-
+    reply(message, f"🆔 Telegram ID: {message.from_user.id}")
 
 @bot.message_handler(commands=["help"])
 def help_command(message):
-    text = """❓ Yardım
-
-💬 Sohbet — Doğal sohbet, bağlam hafızası, çeşitli cevaplar ve duygu uyumu.
-📱 Sanal No — Sanal numara menüsü.
-👤 Telegram ID — Telegram kullanıcı ID'nizi gösterir.
-
-Komutlar: /start /id /help
-
-Not: Küfür/argo tespitinde bot küfür etmeden, üsluba uygun şekilde karşılık verir."""
-
-    bot.send_message(
-        message.chat.id,
-        text,
-        reply_markup=ana_menu()
+    reply(
+        message,
+        "❓ Yardım\n\n"
+        "💬 Sohbet — Mesajlarını cevaplarım.\n"
+        "👤 Telegram ID — Kullanıcı ID'nizi gösterir.\n"
+        "🔄 /start — Botu yeniden başlatır."
     )
 
-
-# ---------------------------------------------------------------------------
-# MENÜ
-# ---------------------------------------------------------------------------
-@bot.message_handler(func=lambda message: message.text == "👤 Telegram ID")
+@bot.message_handler(func=lambda m: m.text == "👤 Telegram ID")
 def menu_id(message):
     user_id(message)
 
-
-@bot.message_handler(func=lambda message: message.text == "❓ Yardım")
+@bot.message_handler(func=lambda m: m.text == "❓ Yardım")
 def menu_help(message):
     help_command(message)
 
+@bot.message_handler(func=lambda m: m.text == "💬 Sohbet")
+def chat(message):
+    reply(message, "💬 Sohbet modu açık dostum. Ne konuşalım?")
 
-@bot.message_handler(func=lambda message: message.text == "📱 Sanal No")
-def virtual_number(message):
-    text = """📱 Sanal Numara
+@bot.message_handler(func=lambda m: True)
+def chat_handler(message):
+    if not message.text:
+        return
+    user_id_value = message.from_user.id
+    memory[user_id_value].append(("user", message.text[:500]))
+    text = message.text.strip()
+    low = text.lower()
 
-Bu menü şu anda yalnızca hesap durumunu kontrol eder.
-Numara satın alma veya doğrulama işlemi otomatikleştirilmemiştir."""
+    if any(x in low for x in ["selam", "merhaba", "hey", "sa"]):
+        answer = "👋 Selam dostum! Buradayım. Nasılsın?"
+    elif any(x in low for x in ["nasılsın", "nasilsin", "naber", "ne haber"]):
+        answer = "😎 İyiyim dostum. Senin keyifler nasıl?"
+    elif any(x in low for x in ["teşekkür", "tesekkur", "sağ ol", "sag ol", "eyvallah"]):
+        answer = "🤝 Rica ederim dostum."
+    elif any(x in low for x in ["görüşürüz", "gorusuruz", "bay bay", "iyi geceler"]):
+        answer = "👋 Görüşürüz dostum. Yine gel."
+    elif "?" in text:
+        answer = "🤔 Güzel soru. Biraz daha detay verirsen beraber bakalım."
+    else:
+        answer = "👀 Anladım dostum. Biraz daha anlat, seni dinliyorum."
 
-    bot.send_message(
-        message.chat.id,
-        text
-    )
+    reply(message, answer)
 
-
-@bot.message_handler(func=lambda message: message.text == "💬 Sohbet")
-def chat_mode(message):
-    bot.reply_to(
-        message,
-        "💬 Sohbet moduna geçtik. Ne konuşmak istersen yaz; yakın konuşmaları dikkate alıp aynı cevabı tekrar etmemeye çalışacağım."
-    )
-
-
-# ---------------------------------------------------------------------------
-# GENEL MESAJ
-# ---------------------------------------------------------------------------
-@bot.message_handler(func=lambda message: True)
-def text_handler(message):
-    mesaj_isle(message)
-
-
-# ---------------------------------------------------------------------------
-# TELEGRAM BAĞLANTISI / POLLING
-# ---------------------------------------------------------------------------
 try:
-    print("[BOOT 4] TeleBot olusturuldu", flush=True)
-
+    print("[FRESH 4] Telegram kimlik doğrulaması basliyor", flush=True)
     me = bot.get_me()
+    print(f"[FRESH 5] TELEGRAM OK: @{me.username} id={me.id}", flush=True)
 
-    print(
-        f"[BOOT 5] Telegram baglantisi OK: @{me.username}",
-        flush=True
-    )
+    bot.delete_webhook(drop_pending_updates=False)
+    print("[FRESH 6] webhook temizlendi", flush=True)
 
-    try:
-        bot.delete_webhook(drop_pending_updates=False)
-
-        print(
-            "[BOOT 6] Webhook temizlendi",
-            flush=True
-        )
-
-    except Exception as exc:
-        print(
-            f"[BOOT 6] Webhook temizleme uyarisi: {type(exc).__name__}: {exc}",
-            flush=True
-        )
-
-    print(
-        "[BOOT 7] Yeni sohbet sistemi hazir",
-        flush=True
-    )
-
-    print(
-        "[BOOT 8] Polling baslatiliyor...",
-        flush=True
-    )
-
-    # Railway üzerinde tek polling sahibi olacak şekilde çalışır.
+    print("[FRESH 7] POLLING BASLIYOR", flush=True)
     bot.infinity_polling(
         skip_pending=False,
         timeout=30,
         long_polling_timeout=30,
-        allowed_updates=["message", "callback_query"]
+        allowed_updates=["message"],
     )
-
 except Exception as exc:
-    print(
-        f"[BOOT] UYGULAMA HATASI: {type(exc).__name__}: {exc}",
-        flush=True
-    )
-
+    print(f"[FRESH ERROR] {type(exc).__name__}: {exc}", flush=True)
     traceback.print_exc()
     sys.exit(1)
