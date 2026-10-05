@@ -1,12 +1,9 @@
 import os
 import sys
 import traceback
-import json
 import random
 import re
 from collections import defaultdict, deque
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
 
 print("[BOOT 1] main.py basladi", flush=True)
 
@@ -56,40 +53,11 @@ def ana_menu():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add(
         types.KeyboardButton("📱 Sanal No"),
-        types.KeyboardButton("💰 Bakiye"),
         types.KeyboardButton("💬 Sohbet"),
         types.KeyboardButton("👤 Telegram ID"),
         types.KeyboardButton("❓ Yardım"),
     )
     return markup
-
-
-# ---------------------------------------------------------------------------
-# SMS VIRTUAL
-# ---------------------------------------------------------------------------
-def smsvirtual_profile():
-    api_key = os.getenv("SMSV_API_KEY")
-    if not api_key:
-        return None, "SMSV_API_KEY tanımlı değil."
-
-    req = Request(
-        "https://api.smsvirtual.io/v1/profile/",
-        headers={
-            "x-api-key": api_key,
-            "Accept": "application/json"
-        },
-        method="GET",
-    )
-
-    try:
-        with urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode("utf-8")), None
-    except HTTPError as exc:
-        return None, f"API HTTP hatası: {exc.code}"
-    except (URLError, TimeoutError) as exc:
-        return None, f"API bağlantı hatası: {type(exc).__name__}"
-    except Exception as exc:
-        return None, f"API hatası: {type(exc).__name__}"
 
 
 # ---------------------------------------------------------------------------
@@ -488,11 +456,6 @@ def niyet_bul(metin):
     ]):
         return "sanal_no"
 
-    if eslesen(low, [
-        "bakiye", "param ne kadar", "hesapta ne var"
-    ]):
-        return "bakiye"
-
     return "genel"
 
 
@@ -530,9 +493,6 @@ def sohbet_yanit(user_id, metin):
 
     if niyet == "sanal_no":
         return "📱 Sanal numara tarafına geçiyoruz. İstersen menüden 📱 Sanal No'ya dokun."
-
-    if niyet == "bakiye":
-        return "💰 Bakiye kontrolü için menüden 💰 Bakiye'ye basabilirsin."
 
     if niyet == "kimlik":
         return cevap_sec(user_id, [
@@ -698,8 +658,7 @@ def help_command(message):
     text = """❓ Yardım
 
 💬 Sohbet — Doğal sohbet, bağlam hafızası, çeşitli cevaplar ve duygu uyumu.
-📱 Sanal No — SMS Virtual hesabı için durum menüsü.
-💰 Bakiye — SMS Virtual hesap bakiyesini kontrol eder.
+📱 Sanal No — Sanal numara menüsü.
 👤 Telegram ID — Telegram kullanıcı ID'nizi gösterir.
 
 Komutlar: /start /id /help
@@ -724,36 +683,6 @@ def menu_id(message):
 @bot.message_handler(func=lambda message: message.text == "❓ Yardım")
 def menu_help(message):
     help_command(message)
-
-
-@bot.message_handler(func=lambda message: message.text == "💰 Bakiye")
-def balance(message):
-    data, error = smsvirtual_profile()
-
-    if error:
-        bot.reply_to(
-            message,
-            f"⚠️ Bakiye alınamadı: {error}"
-        )
-        return
-
-    if isinstance(data, dict):
-        profile = data.get("data", data)
-        if not isinstance(profile, dict):
-            profile = data.get("profile", data)
-    else:
-        profile = {}
-
-    value = (
-        profile.get("balance", "bilinmiyor")
-        if isinstance(profile, dict)
-        else "bilinmiyor"
-    )
-
-    bot.reply_to(
-        message,
-        f"💰 SMS Virtual bakiye: {value}"
-    )
 
 
 @bot.message_handler(func=lambda message: message.text == "📱 Sanal No")
