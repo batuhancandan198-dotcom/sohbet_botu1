@@ -7,7 +7,9 @@ from collections import defaultdict, deque
 
 print("[BOOT 1] main.py basladi", flush=True)
 
-TOKEN = os.getenv("BOT_TOKEN")
+RAW_TOKEN = os.getenv("BOT_TOKEN", "")
+# Railway değişkenine yanlışlıkla boşluk/tırnak yapıştırılması 401'e yol açabilir.
+TOKEN = RAW_TOKEN.strip().strip('"').strip("'").strip()
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN Railway Variables içinde tanımlı değil.")
 
